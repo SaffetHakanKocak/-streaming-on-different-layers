@@ -1,0 +1,195 @@
+version: "3.8"
+
+services:
+  revproxy:
+    image: nginx:latest
+    container_name: revproxy
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - grafana
+      - redpanda-1
+    networks:
+      - streaming_net
+
+  redpanda-1:
+    image: redpandadata/redpanda:v24.1.2
+    container_name: redpanda-1
+    ports:
+      - "19092:19092"
+      - "9092:9092"
+      - "9644:9644"
+    command:
+      - redpanda start --smp 1 --memory 1G --reserve-memory 0M
+        --overprovisioned --node-id 1
+        --check=false
+        --kafka-addr PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:19092
+        --advertise-kafka-addr PLAINTEXT://redpanda-1:9092,OUTSIDE://host.docker.internal:19092
+        --rpc-addr 0.0.0.0:33145
+        --advertise-rpc-addr redpanda-1:33145
+    networks:
+      - streaming_net
+
+  redpanda-2:
+    image: redpandadata/redpanda:v24.1.2
+    container_name: redpanda-2
+    command:
+      - redpanda start --smp 1 --memory 1G --reserve-memory 0M
+        --overprovisioned --node-id 2
+        --kafka-addr PLAINTEXT://0.0.0.0:9092
+        --advertise-kafka-addr PLAINTEXT://redpanda-2:9092
+        --rpc-addr 0.0.0.0:33145
+        --seed-server redpanda-1:33145
+    depends_on:
+      - redpanda-1
+    networks:
+      - streaming_net
+
+  redpanda-3:
+    image: redpandadata/redpanda:v24.1.2
+    container_name: redpanda-3
+    command:
+      - redpanda start --smp 1 --memory 1G --reserve-memory 0M
+        --overprovisioned --node-id 3
+        --kafka-addr PLAINTEXT://0.0.0.0:9092
+        --advertise-kafka-addr PLAINTEXT://redpanda-3:9092
+        --rpc-addr 0.0.0.0:33145
+        --seed-server redpanda-1:33145
+    depends_on:
+      - redpanda-1
+    networks:
+      - streaming_net
+
+  clickhouse-1:
+    image: clickhouse/clickhouse-server:24.4
+    container_name: clickhouse-1
+    ulimits:
+      nofile: 262144
+    volumes:
+      - ./clickhouse_data1:/var/lib/clickhouse
+    environment:
+      - CLICKHOUSE_DB=default
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=
+    networks:
+      - streaming_net
+
+  clickhouse-2:
+    image: clickhouse/clickhouse-server:24.4
+    container_name: clickhouse-2
+    restart: unless-stopped
+    ulimits:
+      nofile: 262144
+    ports:
+      - "8126:8123"    # HTTP interface (Tabix ve REST bağlantısı)
+      - "9002:9000"    # Native TCP interface (client veya worker bağlantısı)
+    volumes:
+      - ./clickhouse_data2:/var/lib/clickhouse
+      - ./clickhouse_config.xml:/etc/clickhouse-server/config.d/custom_config.xml:ro
+    environment:
+      - CLICKHOUSE_DB=default
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=
+    depends_on:
+      - redpanda-1
+    networks:
+      - streaming_net
+
+  tabix:
+    image: spoonest/clickhouse-tabix-web-client
+    container_name: tabix
+    ports:
+      - "8124:80"
+    environment:
+      - CH_NAME=ClickHouse
+      - CH_HOST=clickhouse-1
+      - CH_PORT=8123
+    depends_on:
+      - clickhouse-1
+    networks:
+      - streaming_net
+
+  grafana:
+    image: grafana/grafana:10.3.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s:%(http_port)s/grafana/
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+    networks:
+      - streaming_net
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+    networks:
+      - streaming_net
+
+  anomaly_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    environment:
+      - BROKERS=host.docker.internal:19092
+      - TOPIC=metrics_test
+      - MODEL=phi3:mini
+      - CLICKHOUSE_HOST=clickhouse-2
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASS=
+      - THRESHOLD=70
+      - ZSCORE=2.5
+      - WINDOW=50
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - redpanda-1
+      - clickhouse-2
+      - ollama
+    volumes:
+      - ./tests:/tests
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+    networks:
+      - streaming_net
+
+  vm_stress:
+    image: python:3.11
+    container_name: vm_stress
+    command: >
+      sh -c "pip install kafka-python && python /vm_stress.py"
+    volumes:
+      - ./vm_stress.py:/vm_stress.py
+    depends_on:
+      - redpanda-1
+    networks:
+      - streaming_net
+
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:latest
+    container_name: redpanda-console
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_BROKERS: "redpanda-1:9092,redpanda-2:9092,redpanda-3:9092"
+      KAFKA_CONNECT_ENABLED: "false"
+      REDPANDA_ADMIN_URL: "http://redpanda-1:9644"
+      SERVER_LISTEN_PORT: 8080
+    depends_on:
+      - redpanda-1
+    networks:
+      - streaming_net
+
+networks:
+  streaming_net:
+    driver: bridge
